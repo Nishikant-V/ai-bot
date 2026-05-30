@@ -32,10 +32,34 @@ function ArticleCard({ article }) {
         <span className="source-tag">{article.source}</span>
         <span className="dot">·</span>
         <span className="date-tag">{formatDate(article.date || article.ingested_at)}</span>
+        {article.importance_score && (
+          <span className="importance-badge" style={{ marginLeft: '6px' }}>
+            ⭐ {article.importance_score}/10
+          </span>
+        )}
         {article.category && <span className="cat-tag">{article.category}</span>}
       </div>
       <div className="article-title">{article.title}</div>
       {article.summary && <div className="article-summary">{article.summary}</div>}
+      
+      {article.why_it_matters && (
+        <div className="why-it-matters">
+          <strong>Why it matters:</strong> {article.why_it_matters}
+        </div>
+      )}
+
+      {article.entities && Object.values(article.entities).some(list => list?.length > 0) && (
+        <div className="entity-tags">
+          {Object.entries(article.entities).flatMap(([type, list]) => 
+            (list || []).map(ent => (
+              <span key={ent} className="entity-tag" title={type}>
+                {ent}
+              </span>
+            ))
+          ).slice(0, 5)}
+        </div>
+      )}
+
       <a className="read-link" href={article.url} target="_blank" rel="noopener noreferrer">
         Read full article →
       </a>
@@ -180,16 +204,52 @@ function Briefing() {
         </div>
       )}
 
-      {data.trends?.length > 0 && (
-        <div className="trends-section">
-          <h2>🔥 Top Trends</h2>
-          <div>
-            {data.trends.map((t, i) => (
-              <span key={i} className="trend-pill">
-                <span className="trend-num">{i + 1}</span>
-                {t}
-              </span>
-            ))}
+      {data.key_risks?.length > 0 && (
+        <div className="briefing-section">
+          <h2>⚠️ Key Risks</h2>
+          <ul>
+            {data.key_risks.map((r, i) => <li key={i}>{r}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {data.key_opportunities?.length > 0 && (
+        <div className="briefing-section">
+          <h2>🚀 Key Opportunities</h2>
+          <ul>
+            {data.key_opportunities.map((o, i) => <li key={i}>{o}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {data.important_entities && (
+        <div className="briefing-section">
+          <h2>🏷️ Important Entities</h2>
+          <div className="entity-groups">
+            {data.important_entities.companies?.length > 0 && (
+              <div className="entity-group">
+                <h3>Companies</h3>
+                <div className="tags">
+                  {data.important_entities.companies.map(c => <span key={c} className="entity-tag">{c}</span>)}
+                </div>
+              </div>
+            )}
+            {data.important_entities.people?.length > 0 && (
+              <div className="entity-group">
+                <h3>People</h3>
+                <div className="tags">
+                  {data.important_entities.people.map(p => <span key={p} className="entity-tag">{p}</span>)}
+                </div>
+              </div>
+            )}
+            {data.important_entities.organizations?.length > 0 && (
+              <div className="entity-group">
+                <h3>Organizations</h3>
+                <div className="tags">
+                  {data.important_entities.organizations.map(o => <span key={o} className="entity-tag">{o}</span>)}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -197,17 +257,41 @@ function Briefing() {
       <div>
         <h2 style={{ fontSize: '17px', fontWeight: 700, marginBottom: '16px' }}>📋 Top Stories</h2>
         {(data.top_stories || []).map((s, i) => (
-          <a key={s.id} href={s.url} target="_blank" rel="noopener noreferrer" className="top-story">
-            <div className="story-num">#{i + 1}</div>
-            <div className="story-info">
-              <h3>{s.title}</h3>
+          <div key={s.id} className="top-story-card">
+            <div className="story-header">
+              <span className="story-num">#{i + 1}</span>
+              <a href={s.url} target="_blank" rel="noopener noreferrer" className="story-title-link">
+                <h3>{s.title}</h3>
+              </a>
+              {s.importance_score && (
+                <span className="importance-badge">⭐ {s.importance_score}/10</span>
+              )}
+            </div>
+            <div className="story-body">
               <p>{s.summary || s.content?.slice(0, 120)}</p>
-              <div style={{ display: 'flex', gap: '8px', marginTop: '6px' }}>
-                <span style={{ fontSize: '11px', color: 'var(--accent3)', fontWeight: 700 }}>{s.source}</span>
-                {s.category && <span style={{ fontSize: '11px', color: 'var(--muted)' }}>{s.category}</span>}
+              {s.why_it_matters && (
+                <div className="why-it-matters">
+                  <strong>Why it matters:</strong> {s.why_it_matters}
+                </div>
+              )}
+              {s.entities && Object.values(s.entities).some(list => list?.length > 0) && (
+                <div className="entity-tags">
+                  {Object.entries(s.entities).flatMap(([type, list]) => 
+                    (list || []).map(ent => (
+                      <span key={ent} className="entity-tag" title={type}>
+                        {ent}
+                      </span>
+                    ))
+                  ).slice(0, 8)}
+                </div>
+              )}
+              <div style={{ display: 'flex', gap: '8px', marginTop: '12px', fontSize: '11px', color: 'var(--muted)' }}>
+                <span style={{ color: 'var(--accent3)', fontWeight: 700 }}>{s.source}</span>
+                <span>·</span>
+                <span>{s.category}</span>
               </div>
             </div>
-          </a>
+          </div>
         ))}
       </div>
     </div>

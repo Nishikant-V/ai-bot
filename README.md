@@ -39,23 +39,30 @@ Frontend runs at **http://localhost:3000**
 ## Usage
 
 1. Open **http://localhost:3000**
-2. Click **"⚡ Fetch News"** in the sidebar
-3. Articles are pulled from RSS feeds, deduplicated, and processed by Ollama
-4. Use the **Daily Briefing** tab for an executive summary + trends
+2. Click **"⚡ Fetch News"** in the sidebar (or run `POST /ingest` programmatically)
+3. Articles are pulled from standard RSS feeds and Google News feeds, deduplicated, and processed by LLM/heuristics.
+4. Use the **Daily Briefing** tab for the intelligence dashboard.
 
 ## API
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/ingest` | POST | Pull RSS feeds + LLM process |
-| `/articles` | GET | List (`?page=1&per_page=20&category=AI`) |
-| `/search` | GET | Search (`?q=keyword&category=Technology`) |
-| `/briefing` | GET | Executive summary + top 10 + trends |
+| `/ingest` | POST | Pull RSS & Google News feeds + extract metadata |
+| `/articles` | GET | List (`?page=1&per_page=20&category=AI`) sorted by importance |
+| `/search` | GET | Search (`?q=keyword&category=Technology`) sorted by importance |
+| `/briefing` | GET | Upgraded executive summary, risks, opportunities, top entities |
 | `/stats` | GET | Article counts by source/category |
+
+## Metadata Fields Extracted
+
+For each article, the agent stores and exposes:
+- **importance_score**: Prioritization ranking from 1 to 10
+- **why_it_matters**: A 2-sentence significance summary
+- **entities**: Extracted people, companies, organizations, countries, and locations
 
 ## RSS Sources
 
-Reuters · BBC · AP News · TechCrunch · CNBC
+Reuters · BBC · NPR · TechCrunch · CNBC · Google News (Top, World, Technology, Business, AI searches)
 
 ## Folder Structure
 

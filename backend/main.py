@@ -28,6 +28,12 @@ RSS_FEEDS = {
     "NPR":        "https://feeds.npr.org/1001/rss.xml",
     "TechCrunch": "https://techcrunch.com/feed/",
     "CNBC":       "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    # Priority 1: Google News Feeds
+    "Google News - Top": "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en",
+    "Google News - World": "https://news.google.com/rss/sections/CAAqJggKIiBDQkFTRWdvSUwyMHZNR3gxTXplc0VnSndlR291YW5Sb2tYUXNJRzlyeWxoekx6RTZDbUpIU2pnQVAB?hl=en-US&gl=US&ceid=US:en",
+    "Google News - Tech": "https://news.google.com/rss/sections/CAAqKggKIiRDQkFTRlFvSUwyMHZNR1F3TkdZd0VnSlFiM0psYzNOMFgyOXVTZ2dBUAE?hl=en-US&gl=US&ceid=US:en",
+    "Google News - Business": "https://news.google.com/rss/sections/CAAqKggKIiRDQkFTRlFvSUwyMHZNR3B6YlddeEVnSlFiM0psYzNOMFgyOXVTZ2dBUAE?hl=en-US&gl=US&ceid=US:en",
+    "Google News - AI": "https://news.google.com/rss/search?q=Artificial+Intelligence+OR+Machine+Learning+OR+LLM&hl=en-US&gl=US&ceid=US:en",
 }
 
 CATEGORIES = ["World", "Business", "Technology", "AI", "Science", "Health", "Sports"]
@@ -89,6 +95,10 @@ def init_db():
                 ingested_at TEXT NOT NULL
             )
         """)
+        # Schema migration
+        cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS entities TEXT")
+        cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS importance_score INTEGER DEFAULT 5")
+        cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS why_it_matters TEXT")
         cur.close()
     except Exception as e:
         print(f"DB init error: {e}")
@@ -108,7 +118,7 @@ def fetch_existing_titles(conn) -> list[str]:
     cur.close()
     return [r["title"] for r in rows]
 
-# ── Extractive fallbacks (no LLM needed) ─────────────────────────────────────
+# ── Extractive fallbacks & Heuristics (Priority 2, 3, 4) ─────────────────────
 
 def extractive_summary(text: str, max_chars: int = 180) -> str:
     """Return the first complete sentence up to max_chars."""
@@ -126,6 +136,60 @@ def keyword_category(title: str, content: str) -> str:
         if any(kw in combined for kw in keywords):
             return cat
     return "World"
+
+def extractive_entities(title: str, content: str) -> dict:
+    """Extract entities using lightweight keyword matching as a fallback."""
+    combined = (title + " " + (content or "")).lower()
+    
+    companies_list = ["google", "microsoft", "openai", "meta", "apple", "amazon", "nvidia", "tesla", "anthropic", "netflix", "reuters", "cnbc", "bbc"]
+    orgs_list = ["un", "who", "nato", "eu", "fbi", "cia", "nasa", "sec", "fda", "imf", "wto"]
+    countries_list = ["us", "usa", "china", "uk", "ukraine", "russia", "india", "japan", "germany", "france", "taiwan", "canada"]
+    
+    companies = [c.capitalize() for c in companies_list if f" {c} " in f" {combined} " or combined.startswith(c)]
+    organizations = [o.upper() for o in orgs_list if f" {o} " in f" {combined} " or combined.startswith(o)]
+    countries = [cn.upper() if len(cn) <= 3 else cn.capitalize() for cn in countries_list if f" {cn} " in f" {combined} " or combined.startswith(cn)]
+    
+    # Extract capitalized words from title as potential people/locations
+    words = re.findall(r'\b[A-Z][a-z]+\b', title)
+    people = []
+    locations = []
+    
+    common_stops = ["The", "A", "An", "In", "On", "At", "By", "For", "To", "With", "And", "Or", "But", "Reuters", "Bbc", "Npr", "Cnbc", "TechCrunch"]
+    filtered_words = [w for w in words if w not in common_stops]
+    
+    if filtered_words:
+        for w in filtered_words[:3]:
+            if any(c in w.lower() for c in countries_list) or w.lower() in ["london", "tokyo", "beijing", "washington", "paris", "berlin", "moscow", "kyiv"]:
+                locations.append(w)
+            else:
+                people.append(w)
+
+    return {
+        "people": list(set(people))[:3],
+        "organizations": list(set(organizations))[:3],
+        "companies": list(set(companies))[:3],
+        "countries": list(set(countries))[:3],
+        "locations": list(set(locations))[:3]
+    }
+
+def extractive_importance_score(title: str, content: str) -> int:
+    """Determine article importance score (1-10) using keyword weight heuristics."""
+    combined = (title + " " + (content or "")).lower()
+    score = 5  # baseline
+    
+    high_impact = ["crisis", "war", "tariff", "election", "breakthrough", "acquisition", "billion", "merger", "unprecedented", "regulate", "antitrust"]
+    ai_impact = ["llm", "gpt-4", "claude", "gemini", "openai", "nvidia", "artificial intelligence", "supercomputer"]
+    
+    if any(w in combined for w in high_impact):
+        score += 2
+    if any(w in combined for w in ai_impact):
+        score += 2
+        
+    return min(max(score, 1), 10)
+
+def extractive_why_it_matters(title: str, content: str, category: str) -> str:
+    """Generate a lightweight explanation of why this news is significant."""
+    return f"This updates critical events in {category}. It highlights ongoing shifts in industry standards, strategic developments, and regulatory frameworks."
 
 # ── LLM helpers ──────────────────────────────────────────────────────────────
 
@@ -178,14 +242,20 @@ def extract_json_array(text: str) -> list:
     start = text.find("[")
     end   = text.rfind("]") + 1
     if start >= 0 and end > start:
-        return json.loads(text[start:end])
+        try:
+            return json.loads(text[start:end])
+        except Exception:
+            return []
     return []
 
 def extract_json_object(text: str) -> dict:
     start = text.find("{")
     end   = text.rfind("}") + 1
     if start >= 0 and end > start:
-        return json.loads(text[start:end])
+        try:
+            return json.loads(text[start:end])
+        except Exception:
+            return {}
     return {}
 
 # ── LLM processing ───────────────────────────────────────────────────────────
@@ -200,6 +270,9 @@ def llm_process(articles: list[dict]) -> list[dict]:
         for a in articles:
             a["summary"]  = extractive_summary(a.get("content", ""))
             a["category"] = keyword_category(a["title"], a.get("content", ""))
+            a["entities"] = extractive_entities(a["title"], a.get("content", ""))
+            a["importance_score"] = extractive_importance_score(a["title"], a.get("content", ""))
+            a["why_it_matters"] = extractive_why_it_matters(a["title"], a.get("content", ""), a["category"])
         return articles
 
     BATCH = 5
@@ -214,7 +287,10 @@ def llm_process(articles: list[dict]) -> list[dict]:
             f"Each object must have:\n"
             f'- "id": the numeric ID shown\n'
             f'- "summary": one sentence summary (max 25 words)\n'
-            f'- "category": exactly one of {CATEGORIES}\n\n'
+            f'- "category": exactly one of {CATEGORIES}\n'
+            f'- "importance_score": integer between 1 and 10 based on global/economic/tech/political impact\n'
+            f'- "why_it_matters": maximum 2 sentences explaining why this news is significant\n'
+            f'- "entities": object with keys: "people" (list), "organizations" (list), "companies" (list), "countries" (list), "locations" (list)\n\n'
             f"Articles:\n{batch_text}\n\n"
             f"Return ONLY a valid JSON array. No explanation, no markdown."
         )
@@ -224,19 +300,65 @@ def llm_process(articles: list[dict]) -> list[dict]:
             result_map = {r["id"]: r for r in results if "id" in r}
             for j, a in enumerate(batch):
                 if j in result_map:
-                    a["summary"]  = result_map[j].get("summary", "") or extractive_summary(a.get("content", ""))
-                    cat           = result_map[j].get("category", "")
+                    item = result_map[j]
+                    a["summary"]  = item.get("summary", "") or extractive_summary(a.get("content", ""))
+                    cat           = item.get("category", "")
                     a["category"] = cat if cat in CATEGORIES else keyword_category(a["title"], a.get("content", ""))
+                    
+                    # Store new intelligence parameters
+                    try:
+                        a["importance_score"] = int(item.get("importance_score", extractive_importance_score(a["title"], a.get("content", ""))))
+                    except Exception:
+                        a["importance_score"] = extractive_importance_score(a["title"], a.get("content", ""))
+                    
+                    a["why_it_matters"] = item.get("why_it_matters", "") or extractive_why_it_matters(a["title"], a.get("content", ""), a["category"])
+                    
+                    ent = item.get("entities", {})
+                    if not isinstance(ent, dict):
+                        ent = {}
+                    a["entities"] = {
+                        "people": ent.get("people", []) if isinstance(ent.get("people"), list) else [],
+                        "organizations": ent.get("organizations", []) if isinstance(ent.get("organizations"), list) else [],
+                        "companies": ent.get("companies", []) if isinstance(ent.get("companies"), list) else [],
+                        "countries": ent.get("countries", []) if isinstance(ent.get("countries"), list) else [],
+                        "locations": ent.get("locations", []) if isinstance(ent.get("locations"), list) else []
+                    }
                 else:
                     a["summary"]  = extractive_summary(a.get("content", ""))
                     a["category"] = keyword_category(a["title"], a.get("content", ""))
+                    a["entities"] = extractive_entities(a["title"], a.get("content", ""))
+                    a["importance_score"] = extractive_importance_score(a["title"], a.get("content", ""))
+                    a["why_it_matters"] = extractive_why_it_matters(a["title"], a.get("content", ""), a["category"])
         except Exception as e:
             print(f"LLM batch error: {e} — falling back to extractive")
             for a in batch:
                 a["summary"]  = extractive_summary(a.get("content", ""))
                 a["category"] = keyword_category(a["title"], a.get("content", ""))
+                a["entities"] = extractive_entities(a["title"], a.get("content", ""))
+                a["importance_score"] = extractive_importance_score(a["title"], a.get("content", ""))
+                a["why_it_matters"] = extractive_why_it_matters(a["title"], a.get("content", ""), a["category"])
 
     return articles
+
+def format_article(r) -> dict:
+    d = dict(r)
+    # Parse entities string
+    entities_raw = d.get("entities")
+    if isinstance(entities_raw, str):
+        try:
+            d["entities"] = json.loads(entities_raw)
+        except Exception:
+            d["entities"] = {"people": [], "organizations": [], "companies": [], "countries": [], "locations": []}
+    elif not isinstance(entities_raw, dict):
+        d["entities"] = {"people": [], "organizations": [], "companies": [], "countries": [], "locations": []}
+    
+    # Defaults
+    if d.get("importance_score") is None:
+        d["importance_score"] = 5
+    if d.get("why_it_matters") is None:
+        d["why_it_matters"] = ""
+        
+    return d
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 
@@ -282,7 +404,6 @@ def ingest(x_api_key: Optional[str] = Header(None)):
     """
     Pull RSS feeds, deduplicate, and LLM-process new articles.
     Protected by x-api-key header when INGEST_API_KEY env var is set.
-    This is an administrative endpoint — do not expose the key in frontend code.
     """
     if INGEST_API_KEY and x_api_key != INGEST_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing x-api-key header")
@@ -335,11 +456,12 @@ def ingest(x_api_key: Optional[str] = Header(None)):
                     cur = conn.cursor()
                     cur.execute(
                         "INSERT INTO articles "
-                        "(url_hash,title,source,date,url,content,summary,category,ingested_at) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                        "(url_hash,title,source,date,url,content,summary,category,ingested_at,entities,importance_score,why_it_matters) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                         "ON CONFLICT (url_hash) DO NOTHING",
                         (a["url_hash"], a["title"], a["source"], a["date"],
-                         a["url"], a["content"], a["summary"], a["category"], now),
+                         a["url"], a["content"], a["summary"], a["category"], now,
+                         json.dumps(a["entities"]), a["importance_score"], a["why_it_matters"]),
                     )
                     cur.close()
                 except Exception as e:
@@ -357,20 +479,20 @@ def get_articles(page: int = 1, per_page: int = 20, category: Optional[str] = No
     try:
         if category:
             cur   = db_execute(conn,
-                "SELECT * FROM articles WHERE category=%s ORDER BY ingested_at DESC LIMIT %s OFFSET %s",
+                "SELECT * FROM articles WHERE category=%s ORDER BY importance_score DESC, ingested_at DESC LIMIT %s OFFSET %s",
                 (category, per_page, offset))
             rows  = cur.fetchall(); cur.close()
             cur2  = db_execute(conn, "SELECT COUNT(*) AS count FROM articles WHERE category=%s", (category,))
             total = cur2.fetchone()["count"]; cur2.close()
         else:
             cur   = db_execute(conn,
-                "SELECT * FROM articles ORDER BY ingested_at DESC LIMIT %s OFFSET %s",
+                "SELECT * FROM articles ORDER BY importance_score DESC, ingested_at DESC LIMIT %s OFFSET %s",
                 (per_page, offset))
             rows  = cur.fetchall(); cur.close()
             cur2  = db_execute(conn, "SELECT COUNT(*) AS count FROM articles")
             total = cur2.fetchone()["count"]; cur2.close()
 
-        return {"articles": [dict(r) for r in rows], "total": total, "page": page, "per_page": per_page}
+        return {"articles": [format_article(r) for r in rows], "total": total, "page": page, "per_page": per_page}
     finally:
         return_db(conn)
 
@@ -384,18 +506,18 @@ def search(q: str = Query(""), category: Optional[str] = None):
             cur = db_execute(conn,
                 "SELECT * FROM articles "
                 "WHERE (title ILIKE %s OR content ILIKE %s OR summary ILIKE %s) "
-                "AND category=%s ORDER BY ingested_at DESC LIMIT 50",
+                "AND category=%s ORDER BY importance_score DESC, ingested_at DESC LIMIT 50",
                 (like, like, like, category))
         else:
             cur = db_execute(conn,
                 "SELECT * FROM articles "
                 "WHERE title ILIKE %s OR content ILIKE %s OR summary ILIKE %s "
-                "ORDER BY ingested_at DESC LIMIT 50",
+                "ORDER BY importance_score DESC, ingested_at DESC LIMIT 50",
                 (like, like, like))
 
         rows = cur.fetchall()
         cur.close()
-        return {"articles": [dict(r) for r in rows], "query": q}
+        return {"articles": [format_article(r) for r in rows], "query": q}
     finally:
         return_db(conn)
 
@@ -406,56 +528,114 @@ def briefing():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
         cur  = db_execute(conn,
-            "SELECT * FROM articles WHERE ingested_at >= %s ORDER BY ingested_at DESC LIMIT 100",
+            "SELECT * FROM articles WHERE ingested_at >= %s ORDER BY importance_score DESC, ingested_at DESC LIMIT 100",
             (today,))
         rows = cur.fetchall(); cur.close()
 
         if not rows:
-            cur  = db_execute(conn, "SELECT * FROM articles ORDER BY ingested_at DESC LIMIT 50")
+            cur  = db_execute(conn, "SELECT * FROM articles ORDER BY importance_score DESC, ingested_at DESC LIMIT 50")
             rows = cur.fetchall(); cur.close()
 
-        articles = [dict(r) for r in rows]
+        articles = [format_article(r) for r in rows]
     finally:
         return_db(conn)
 
     if not articles:
-        return {"executive_summary": "No articles available.", "top_stories": [], "trends": []}
+        return {
+            "executive_summary": "No articles available.",
+            "top_stories": [],
+            "key_risks": [],
+            "key_opportunities": [],
+            "important_entities": {"companies": [], "people": [], "organizations": []}
+        }
 
     top_stories = articles[:10]
 
+    # Pre-calculate consolidated entities from top 10 articles
+    companies = set()
+    people = set()
+    organizations = set()
+    for a in top_stories:
+        ent = a.get("entities") or {}
+        if isinstance(ent, dict):
+            for c in ent.get("companies", []): companies.add(c)
+            for p in ent.get("people", []): people.add(p)
+            for o in ent.get("organizations", []): organizations.add(o)
+
+    consolidated_entities = {
+        "companies": list(companies)[:10],
+        "people": list(people)[:10],
+        "organizations": list(organizations)[:10]
+    }
+
     def extractive_briefing():
+        cats = [a["category"] for a in articles if a.get("category")]
         from collections import Counter
-        sources = list({a["source"] for a in articles})
-        cats    = list({a["category"] for a in articles if a.get("category")})
+        cat_counts = Counter(cats)
+        dominant_cat = cat_counts.most_common(1)[0][0] if cat_counts else "General"
+        
         summary = (
-            f"Today's briefing covers {len(articles)} articles from "
-            f"{', '.join(sources[:3])} and other sources. "
-            f"Topics span {', '.join(cats[:4]) if cats else 'various categories'}."
+            f"Daily briefing compiling {len(articles)} analyzed news events, prioritized by global impact. "
+            f"Significant updates in {dominant_cat} and related fields detail ongoing changes to business models and technical progress."
         )
-        cat_counts = Counter(a["category"] for a in articles if a.get("category"))
-        trends = [f"{cat} ({count} stories)" for cat, count in cat_counts.most_common(5)]
-        return {"executive_summary": summary, "top_stories": top_stories, "trends": trends}
+        
+        risks = [
+            f"Increased regulatory and compliance checks in {dominant_cat} technologies.",
+            "Potential economic turbulence affecting supply chains and investment funding.",
+            "Competitive and security challenges from emerging technical deployments."
+        ]
+        
+        opportunities = [
+            "Increased efficiencies from adopting artificial intelligence and automation.",
+            "Strategic partnerships and market growth in high-importance areas.",
+            "New research discoveries enabling novel product developments."
+        ]
+        
+        return {
+            "executive_summary": summary,
+            "top_stories": top_stories,
+            "key_risks": risks,
+            "key_opportunities": opportunities,
+            "important_entities": consolidated_entities
+        }
 
     if not llm_available():
         return extractive_briefing()
 
     stories_text = "\n".join(
-        f"- {a['title']} ({a['source']}): {a.get('summary', '')}" for a in top_stories
+        f"- {a['title']} ({a['source']}) [Importance: {a['importance_score']}]: {a['summary']}. Why it matters: {a['why_it_matters']}"
+        for a in top_stories
     )
     prompt = (
-        "You are a news editor. Based on these top stories, provide:\n"
-        "1. A 3-sentence executive summary of today's news\n"
-        "2. Top 5 trending themes/topics as short phrases\n\n"
+        "You are a professional news editor. Based on these top stories, compile a daily briefing in JSON format.\n"
+        "Provide:\n"
+        "1. A 3-sentence executive_summary summarizing today's main news.\n"
+        "2. A list of 3 key_risks identified from these stories.\n"
+        "3. A list of 3 key_opportunities identified from these stories.\n"
+        "4. A dictionary/object of consolidated important_entities found across these stories with keys: 'companies', 'people', 'organizations'. Avoid duplicate entries.\n\n"
         f"Stories:\n{stories_text}\n\n"
-        'Return ONLY valid JSON: {"executive_summary": "...", "trends": ["t1","t2","t3","t4","t5"]}'
+        'Return ONLY valid JSON with these keys: {"executive_summary": "...", "key_risks": ["..."], "key_opportunities": ["..."], "important_entities": {"companies": [...], "people": [...], "organizations": [...]}}'
     )
     try:
         raw    = llm_generate(prompt, timeout=90)
         result = extract_json_object(raw)
+        
+        final_entities = result.get("important_entities", {})
+        if not final_entities or not isinstance(final_entities, dict):
+            final_entities = consolidated_entities
+        else:
+            final_entities = {
+                "companies": final_entities.get("companies", consolidated_entities["companies"]),
+                "people": final_entities.get("people", consolidated_entities["people"]),
+                "organizations": final_entities.get("organizations", consolidated_entities["organizations"])
+            }
+
         return {
-            "executive_summary": result.get("executive_summary", ""),
+            "executive_summary": result.get("executive_summary", "") or extractive_briefing()["executive_summary"],
             "top_stories":       top_stories,
-            "trends":            result.get("trends", []),
+            "key_risks":         result.get("key_risks", []) or extractive_briefing()["key_risks"],
+            "key_opportunities": result.get("key_opportunities", []) or extractive_briefing()["key_opportunities"],
+            "important_entities": final_entities,
         }
     except Exception as e:
         print(f"Briefing LLM error: {e}")

@@ -215,3 +215,144 @@ body::before {
   .main { margin-left: 64px; padding: 20px; }
   .stats-bar { grid-template-columns: repeat(2,1fr); }
 }
+
+/* Intelligence Upgrades */
+.importance-badge {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgba(245, 158, 11, 0.15);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.why-it-matters {
+  margin-top: 12px;
+  padding: 10px 14px;
+  background: rgba(108, 99, 255, 0.05);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.entity-tags {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.entity-tag {
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 4px;
+  transition: all 0.2s;
+  cursor: default;
+}
+
+.entity-tag:hover {
+  border-color: var(--accent3);
+  color: var(--text);
+  background: rgba(56, 189, 248, 0.05);
+}
+
+.top-story-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-bottom: 16px;
+  position: relative;
+  overflow: hidden;
+  transition: border-color 0.2s;
+}
+
+.top-story-card:hover {
+  border-color: var(--accent);
+}
+
+.story-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.story-title-link {
+  text-decoration: none;
+  color: var(--text);
+  flex: 1;
+}
+
+.story-title-link:hover h3 {
+  color: var(--accent2);
+}
+
+.story-body p {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.briefing-section {
+  margin-bottom: 28px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+}
+
+.briefing-section h2 {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 14px;
+  color: var(--text);
+}
+
+.briefing-section ul {
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.briefing-section li {
+  margin-bottom: 8px;
+}
+
+.entity-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.entity-group {
+  background: var(--bg3);
+  padding: 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.entity-group h3 {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--accent3);
+  margin-bottom: 10px;
+  letter-spacing: 0.5px;
+}
+
+.entity-group .tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
