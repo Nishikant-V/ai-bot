@@ -9,10 +9,16 @@ import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-DATABASE_URL   = os.getenv("DATABASE_URL")
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama3-8b-8192")
-INGEST_API_KEY = os.getenv("INGEST_API_KEY", "")
+DATABASE_URL      = os.getenv("DATABASE_URL")
+INGEST_API_KEY    = os.getenv("INGEST_API_KEY", "")
+
+# ── LLM provider config (all optional — app works without any) ───────────────
+# Priority: OpenRouter → Gemini → extractive fallback
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+
 
 RSS_FEEDS = {
     "Reuters":    "https://feeds.reuters.com/reuters/topNews",
@@ -103,29 +109,52 @@ def keyword_category(title: str, content: str) -> str:
             return cat
     return "World"
 
-# ── Groq helpers ──────────────────────────────────────────────────────────────
+# ── LLM helpers ──────────────────────────────────────────────────────────────
 
-def groq_available() -> bool:
-    return bool(GROQ_API_KEY)
+def llm_available() -> bool:
+    return bool(OPENROUTER_API_KEY or GEMINI_API_KEY)
 
-def groq_generate(prompt: str, timeout: int = 60) -> str:
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-    }
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
+def _openrouter_generate(prompt: str, timeout: int) -> str:
+    """Call OpenRouter — free models, OpenAI-compatible API."""
     r = httpx.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        json=payload,
-        headers=headers,
+        "https://openrouter.ai/api/v1/chat/completions",
+        json={
+            "model": OPENROUTER_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+        },
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/Nishikant-V/ai-bot",
+        },
         timeout=timeout,
     )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"].strip()
+
+def _gemini_generate(prompt: str, timeout: int) -> str:
+    """Call Gemini 1.5 Flash — free tier via Google AI Studio key."""
+    r = httpx.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        params={"key": GEMINI_API_KEY},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2},
+        },
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+def llm_generate(prompt: str, timeout: int = 60) -> str:
+    """Try OpenRouter first, then Gemini. Raises if neither is configured."""
+    if OPENROUTER_API_KEY:
+        return _openrouter_generate(prompt, timeout)
+    if GEMINI_API_KEY:
+        return _gemini_generate(prompt, timeout)
+    raise RuntimeError("No LLM provider configured — using extractive fallback")
+
 
 def extract_json_array(text: str) -> list:
     start = text.find("[")
@@ -144,12 +173,12 @@ def extract_json_object(text: str) -> dict:
 # ── LLM processing ───────────────────────────────────────────────────────────
 
 def llm_process(articles: list[dict]) -> list[dict]:
-    """Process articles with Groq; fall back to extractive methods if unavailable."""
+    """Process articles with LLM; fall back to extractive methods if unavailable."""
     if not articles:
         return articles
 
-    if not groq_available():
-        print("Groq unavailable — using extractive fallback")
+    if not llm_available():
+        print("No LLM provider configured — using extractive fallback")
         for a in articles:
             a["summary"]  = extractive_summary(a.get("content", ""))
             a["category"] = keyword_category(a["title"], a.get("content", ""))
@@ -172,7 +201,7 @@ def llm_process(articles: list[dict]) -> list[dict]:
             f"Return ONLY a valid JSON array. No explanation, no markdown."
         )
         try:
-            raw     = groq_generate(prompt)
+            raw     = llm_generate(prompt)
             results = extract_json_array(raw)
             result_map = {r["id"]: r for r in results if "id" in r}
             for j, a in enumerate(batch):
@@ -184,7 +213,7 @@ def llm_process(articles: list[dict]) -> list[dict]:
                     a["summary"]  = extractive_summary(a.get("content", ""))
                     a["category"] = keyword_category(a["title"], a.get("content", ""))
         except Exception as e:
-            print(f"Groq batch error: {e} — falling back to extractive")
+            print(f"LLM batch error: {e} — falling back to extractive")
             for a in batch:
                 a["summary"]  = extractive_summary(a.get("content", ""))
                 a["category"] = keyword_category(a["title"], a.get("content", ""))
@@ -363,7 +392,7 @@ def briefing():
         trends = [f"{cat} ({count} stories)" for cat, count in cat_counts.most_common(5)]
         return {"executive_summary": summary, "top_stories": top_stories, "trends": trends}
 
-    if not groq_available():
+    if not llm_available():
         return extractive_briefing()
 
     stories_text = "\n".join(
@@ -377,7 +406,7 @@ def briefing():
         'Return ONLY valid JSON: {"executive_summary": "...", "trends": ["t1","t2","t3","t4","t5"]}'
     )
     try:
-        raw    = groq_generate(prompt, timeout=90)
+        raw    = llm_generate(prompt, timeout=90)
         result = extract_json_object(raw)
         return {
             "executive_summary": result.get("executive_summary", ""),
@@ -385,7 +414,7 @@ def briefing():
             "trends":            result.get("trends", []),
         }
     except Exception as e:
-        print(f"Briefing Groq error: {e}")
+        print(f"Briefing LLM error: {e}")
         return extractive_briefing()
 
 

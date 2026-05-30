@@ -8,10 +8,12 @@ services:
     plan: free
     envVars:
       - key: DATABASE_URL
-        sync: false        # Set manually in Render dashboard — Neon connection string
-      - key: GROQ_API_KEY
-        sync: false        # Set manually in Render dashboard — from console.groq.com
+        sync: false        # Set manually — Neon connection string (REQUIRED)
       - key: INGEST_API_KEY
-        sync: false        # Set manually in Render dashboard — your chosen secret string
+        sync: false        # Set manually — your chosen secret string (REQUIRED)
+      - key: OPENROUTER_API_KEY
+        sync: false        # OPTIONAL — free models at openrouter.ai
+      - key: GEMINI_API_KEY
+        sync: false        # OPTIONAL — free tier at aistudio.google.com
       - key: PYTHON_VERSION
         value: "3.11"
