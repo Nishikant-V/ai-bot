@@ -8,9 +8,11 @@ from contextlib import asynccontextmanager
 import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool
 
-DATABASE_URL      = os.getenv("DATABASE_URL")
-INGEST_API_KEY    = os.getenv("INGEST_API_KEY", "")
+DATABASE_URL       = os.getenv("DATABASE_URL")
+INGEST_API_KEY     = os.getenv("INGEST_API_KEY", "")
+FRONTEND_URL       = os.getenv("FRONTEND_URL", "")  # e.g. https://your-app.vercel.app
 
 # ── LLM provider config (all optional — app works without any) ───────────────
 # Priority: OpenRouter → Gemini → extractive fallback
@@ -40,12 +42,28 @@ CATEGORY_KEYWORDS = {
     "World":      [],  # catch-all
 }
 
-# ── Database helpers ──────────────────────────────────────────────────────────
+# ── Connection Pool ───────────────────────────────────────────────────────────
+# Neon free tier allows ~100 connections; keeping a small pool (1–5) is safe.
+
+_pool: Optional[ThreadedConnectionPool] = None
+
+def get_pool() -> ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        _pool = ThreadedConnectionPool(1, 5, DATABASE_URL)
+    return _pool
 
 def get_db():
-    conn = psycopg2.connect(DATABASE_URL)
+    """Borrow a connection from the pool (autocommit enabled)."""
+    conn = get_pool().getconn()
     conn.autocommit = True
     return conn
+
+def return_db(conn) -> None:
+    """Return a borrowed connection back to the pool."""
+    get_pool().putconn(conn)
+
+# ── Database helpers ──────────────────────────────────────────────────────────
 
 def db_execute(conn, query: str, params=None):
     """Execute a query and return the cursor (caller must close it)."""
@@ -76,7 +94,7 @@ def init_db():
         print(f"DB init error: {e}")
         raise
     finally:
-        conn.close()
+        return_db(conn)
 
 def url_hash(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()
@@ -201,8 +219,8 @@ def llm_process(articles: list[dict]) -> list[dict]:
             f"Return ONLY a valid JSON array. No explanation, no markdown."
         )
         try:
-            raw     = llm_generate(prompt)
-            results = extract_json_array(raw)
+            raw        = llm_generate(prompt)
+            results    = extract_json_array(raw)
             result_map = {r["id"]: r for r in results if "id" in r}
             for j, a in enumerate(batch):
                 if j in result_map:
@@ -224,13 +242,19 @@ def llm_process(articles: list[dict]) -> list[dict]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    get_pool()   # initialise connection pool on startup
     init_db()
     yield
+    if _pool:
+        _pool.closeall()  # drain pool cleanly on shutdown
 
 app = FastAPI(title="News Intelligence Agent", lifespan=lifespan)
+
+# CORS: restrict to configured frontend origin in production; allow all in dev.
+_origins = [FRONTEND_URL] if FRONTEND_URL else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -239,140 +263,160 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Liveness + DB connectivity check used by Render's healthCheckPath."""
+    try:
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+        finally:
+            return_db(conn)
+        return {"status": "ok", "db": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"DB unavailable: {e}")
 
 
 @app.post("/ingest")
 def ingest(x_api_key: Optional[str] = Header(None)):
-    # Enforce API key when one is configured (skip check in dev if key is unset)
+    """
+    Pull RSS feeds, deduplicate, and LLM-process new articles.
+    Protected by x-api-key header when INGEST_API_KEY env var is set.
+    This is an administrative endpoint — do not expose the key in frontend code.
+    """
     if INGEST_API_KEY and x_api_key != INGEST_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing x-api-key header")
 
     conn = get_db()
-    existing_titles = fetch_existing_titles(conn)
-    new_articles: list[dict] = []
+    try:
+        existing_titles = fetch_existing_titles(conn)
+        new_articles: list[dict] = []
 
-    for source, feed_url in RSS_FEEDS.items():
-        try:
-            feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:20]:
-                url   = getattr(entry, "link",  "")
-                title = getattr(entry, "title", "").strip()
-                if not url or not title:
-                    continue
-                h = url_hash(url)
-
-                # Skip exact-URL duplicates
-                cur = db_execute(conn, "SELECT id FROM articles WHERE url_hash=%s", (h,))
-                exists = cur.fetchone()
-                cur.close()
-                if exists:
-                    continue
-
-                # Skip near-duplicate titles
-                if any(is_similar_title(title, t) for t in existing_titles):
-                    continue
-
-                content  = getattr(entry, "summary", "") or getattr(entry, "description", "")
-                date_str = ""
-                if hasattr(entry, "published_parsed") and entry.published_parsed:
-                    date_str = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).isoformat()
-
-                new_articles.append({
-                    "url_hash": h, "title": title, "source": source,
-                    "date": date_str, "url": url, "content": content,
-                    "summary": "", "category": "",
-                })
-                existing_titles.append(title)
-        except Exception as e:
-            print(f"Error fetching {source}: {e}")
-
-    if new_articles:
-        processed = llm_process(new_articles)
-        now = datetime.now(timezone.utc).isoformat()
-        for a in processed:
+        for source, feed_url in RSS_FEEDS.items():
             try:
-                cur = conn.cursor()
-                cur.execute(
-                    "INSERT INTO articles "
-                    "(url_hash,title,source,date,url,content,summary,category,ingested_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                    "ON CONFLICT (url_hash) DO NOTHING",
-                    (a["url_hash"], a["title"], a["source"], a["date"],
-                     a["url"], a["content"], a["summary"], a["category"], now),
-                )
-                cur.close()
-            except Exception as e:
-                print(f"Insert error: {e}")
+                feed = feedparser.parse(feed_url)
+                for entry in feed.entries[:20]:
+                    url   = getattr(entry, "link",  "")
+                    title = getattr(entry, "title", "").strip()
+                    if not url or not title:
+                        continue
+                    h = url_hash(url)
 
-    conn.close()
-    return {"ingested": len(new_articles), "sources": list(RSS_FEEDS.keys())}
+                    # Skip exact-URL duplicates
+                    cur = db_execute(conn, "SELECT id FROM articles WHERE url_hash=%s", (h,))
+                    exists = cur.fetchone()
+                    cur.close()
+                    if exists:
+                        continue
+
+                    # Skip near-duplicate titles
+                    if any(is_similar_title(title, t) for t in existing_titles):
+                        continue
+
+                    content  = getattr(entry, "summary", "") or getattr(entry, "description", "")
+                    date_str = ""
+                    if hasattr(entry, "published_parsed") and entry.published_parsed:
+                        date_str = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).isoformat()
+
+                    new_articles.append({
+                        "url_hash": h, "title": title, "source": source,
+                        "date": date_str, "url": url, "content": content,
+                        "summary": "", "category": "",
+                    })
+                    existing_titles.append(title)
+            except Exception as e:
+                print(f"Error fetching {source}: {e}")
+
+        if new_articles:
+            processed = llm_process(new_articles)
+            now = datetime.now(timezone.utc).isoformat()
+            for a in processed:
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "INSERT INTO articles "
+                        "(url_hash,title,source,date,url,content,summary,category,ingested_at) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                        "ON CONFLICT (url_hash) DO NOTHING",
+                        (a["url_hash"], a["title"], a["source"], a["date"],
+                         a["url"], a["content"], a["summary"], a["category"], now),
+                    )
+                    cur.close()
+                except Exception as e:
+                    print(f"Insert error: {e}")
+
+        return {"ingested": len(new_articles), "sources": list(RSS_FEEDS.keys())}
+    finally:
+        return_db(conn)
 
 
 @app.get("/articles")
 def get_articles(page: int = 1, per_page: int = 20, category: Optional[str] = None):
     conn   = get_db()
     offset = (page - 1) * per_page
+    try:
+        if category:
+            cur   = db_execute(conn,
+                "SELECT * FROM articles WHERE category=%s ORDER BY ingested_at DESC LIMIT %s OFFSET %s",
+                (category, per_page, offset))
+            rows  = cur.fetchall(); cur.close()
+            cur2  = db_execute(conn, "SELECT COUNT(*) AS count FROM articles WHERE category=%s", (category,))
+            total = cur2.fetchone()["count"]; cur2.close()
+        else:
+            cur   = db_execute(conn,
+                "SELECT * FROM articles ORDER BY ingested_at DESC LIMIT %s OFFSET %s",
+                (per_page, offset))
+            rows  = cur.fetchall(); cur.close()
+            cur2  = db_execute(conn, "SELECT COUNT(*) AS count FROM articles")
+            total = cur2.fetchone()["count"]; cur2.close()
 
-    if category:
-        cur   = db_execute(conn,
-            "SELECT * FROM articles WHERE category=%s ORDER BY ingested_at DESC LIMIT %s OFFSET %s",
-            (category, per_page, offset))
-        rows  = cur.fetchall(); cur.close()
-        cur2  = db_execute(conn, "SELECT COUNT(*) AS count FROM articles WHERE category=%s", (category,))
-        total = cur2.fetchone()["count"]; cur2.close()
-    else:
-        cur   = db_execute(conn,
-            "SELECT * FROM articles ORDER BY ingested_at DESC LIMIT %s OFFSET %s",
-            (per_page, offset))
-        rows  = cur.fetchall(); cur.close()
-        cur2  = db_execute(conn, "SELECT COUNT(*) AS count FROM articles")
-        total = cur2.fetchone()["count"]; cur2.close()
-
-    conn.close()
-    return {"articles": [dict(r) for r in rows], "total": total, "page": page, "per_page": per_page}
+        return {"articles": [dict(r) for r in rows], "total": total, "page": page, "per_page": per_page}
+    finally:
+        return_db(conn)
 
 
 @app.get("/search")
 def search(q: str = Query(""), category: Optional[str] = None):
     conn = get_db()
     like = f"%{q}%"
+    try:
+        if category:
+            cur = db_execute(conn,
+                "SELECT * FROM articles "
+                "WHERE (title ILIKE %s OR content ILIKE %s OR summary ILIKE %s) "
+                "AND category=%s ORDER BY ingested_at DESC LIMIT 50",
+                (like, like, like, category))
+        else:
+            cur = db_execute(conn,
+                "SELECT * FROM articles "
+                "WHERE title ILIKE %s OR content ILIKE %s OR summary ILIKE %s "
+                "ORDER BY ingested_at DESC LIMIT 50",
+                (like, like, like))
 
-    if category:
-        cur = db_execute(conn,
-            "SELECT * FROM articles "
-            "WHERE (title ILIKE %s OR content ILIKE %s OR summary ILIKE %s) "
-            "AND category=%s ORDER BY ingested_at DESC LIMIT 50",
-            (like, like, like, category))
-    else:
-        cur = db_execute(conn,
-            "SELECT * FROM articles "
-            "WHERE title ILIKE %s OR content ILIKE %s OR summary ILIKE %s "
-            "ORDER BY ingested_at DESC LIMIT 50",
-            (like, like, like))
-
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return {"articles": [dict(r) for r in rows], "query": q}
+        rows = cur.fetchall()
+        cur.close()
+        return {"articles": [dict(r) for r in rows], "query": q}
+    finally:
+        return_db(conn)
 
 
 @app.get("/briefing")
 def briefing():
     conn  = get_db()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    cur  = db_execute(conn,
-        "SELECT * FROM articles WHERE ingested_at >= %s ORDER BY ingested_at DESC LIMIT 100",
-        (today,))
-    rows = cur.fetchall(); cur.close()
-
-    if not rows:
-        cur  = db_execute(conn, "SELECT * FROM articles ORDER BY ingested_at DESC LIMIT 50")
+    try:
+        cur  = db_execute(conn,
+            "SELECT * FROM articles WHERE ingested_at >= %s ORDER BY ingested_at DESC LIMIT 100",
+            (today,))
         rows = cur.fetchall(); cur.close()
 
-    articles = [dict(r) for r in rows]
-    conn.close()
+        if not rows:
+            cur  = db_execute(conn, "SELECT * FROM articles ORDER BY ingested_at DESC LIMIT 50")
+            rows = cur.fetchall(); cur.close()
+
+        articles = [dict(r) for r in rows]
+    finally:
+        return_db(conn)
 
     if not articles:
         return {"executive_summary": "No articles available.", "top_stories": [], "trends": []}
@@ -421,21 +465,22 @@ def briefing():
 @app.get("/stats")
 def stats():
     conn = get_db()
+    try:
+        cur   = db_execute(conn, "SELECT COUNT(*) AS count FROM articles")
+        total = cur.fetchone()["count"]; cur.close()
 
-    cur   = db_execute(conn, "SELECT COUNT(*) AS count FROM articles")
-    total = cur.fetchone()["count"]; cur.close()
+        cur         = db_execute(conn,
+            "SELECT category, COUNT(*) AS count FROM articles GROUP BY category ORDER BY count DESC")
+        by_category = cur.fetchall(); cur.close()
 
-    cur         = db_execute(conn,
-        "SELECT category, COUNT(*) AS count FROM articles GROUP BY category ORDER BY count DESC")
-    by_category = cur.fetchall(); cur.close()
+        cur       = db_execute(conn,
+            "SELECT source, COUNT(*) AS count FROM articles GROUP BY source ORDER BY count DESC")
+        by_source = cur.fetchall(); cur.close()
 
-    cur       = db_execute(conn,
-        "SELECT source, COUNT(*) AS count FROM articles GROUP BY source ORDER BY count DESC")
-    by_source = cur.fetchall(); cur.close()
-
-    conn.close()
-    return {
-        "total":       total,
-        "by_category": [dict(r) for r in by_category],
-        "by_source":   [dict(r) for r in by_source],
-    }
+        return {
+            "total":       total,
+            "by_category": [dict(r) for r in by_category],
+            "by_source":   [dict(r) for r in by_source],
+        }
+    finally:
+        return_db(conn)

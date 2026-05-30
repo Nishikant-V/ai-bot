@@ -278,7 +278,7 @@ export default function App() {
     try {
       const r = await fetch(`${API}/ingest`, { method: 'POST' })
       if (r.status === 401) {
-        showToast('Ingestion requires admin access — use the API directly', 'error')
+        showToast('Admin-only: send POST /ingest with x-api-key header to ingest news.', 'error')
         return
       }
       const d = await r.json()
@@ -314,7 +314,10 @@ export default function App() {
           <button className={`ingest-btn${ingesting ? ' loading' : ''}`} onClick={ingest} disabled={ingesting}>
             {ingesting ? '⏳ Fetching…' : '⚡ Fetch News'}
           </button>
-          <div style={{ fontSize: '11px', color: 'var(--muted)', marginTop: '10px', textAlign: 'center' }}>
+          <div style={{ fontSize: '11px', color: 'var(--muted)', marginTop: '8px', textAlign: 'center' }}>
+            🔒 Admin operation — requires API key
+          </div>
+          <div style={{ fontSize: '11px', color: 'var(--muted)', marginTop: '4px', textAlign: 'center' }}>
             {stats.total} articles stored
           </div>
         </div>
