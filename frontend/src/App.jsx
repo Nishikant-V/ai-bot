@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from 'react'
 
-const API = '/api'
+// In dev: Vite proxies /api → localhost:8000 (vite.config.js)
+// In prod: VITE_API_BASE = full Render backend URL (set in Vercel env vars)
+const API = import.meta.env.VITE_API_BASE || '/api'
 const CATS = ['All', 'World', 'Business', 'Technology', 'AI', 'Science', 'Health', 'Sports']
 const CAT_COLORS = {
   World: '#6c63ff', Business: '#f59e0b', Technology: '#38bdf8',
@@ -275,6 +277,10 @@ export default function App() {
     setIngesting(true)
     try {
       const r = await fetch(`${API}/ingest`, { method: 'POST' })
+      if (r.status === 401) {
+        showToast('Ingestion requires admin access — use the API directly', 'error')
+        return
+      }
       const d = await r.json()
       showToast(`✓ Ingested ${d.ingested} new articles`, 'success')
       loadStats()
